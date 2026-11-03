@@ -55,12 +55,3 @@ tests/run_tests.sh           tests
 Makefile                     build and test targets
 ```
 
-## Changes from the original version
-
-- Signature search compares bytes with explicit sizes instead of `strstr`, which stopped at the first zero byte and gave false positives.
-- Fixed the missing `break` that made a normal scan fall through into the quick-scan code. The quick scan now really checks only the first and last 20%.
-- Fixed a heap buffer overflow in the file-name sort (names were swapped by copying strings into buffers of a different length); it now uses `qsort`.
-- Fixed a format-string vulnerability in `printAndLog` (it passed the message directly to `printf`); it is now a printf-style function.
-- A file that can't be opened is reported and skipped instead of ending the scan; empty or unreadable signature files are rejected.
-- Paths are built with `snprintf` and checked for length.
-- Builds on Linux as well as Windows; removed a junk `test.c` and the generated log from the repository.
