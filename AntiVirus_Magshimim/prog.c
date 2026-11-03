@@ -1,28 +1,48 @@
 #include <stdio.h>
-#include "dirent.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
 #include <stdbool.h>
+#include <limits.h>
 
+#ifdef _WIN32
+#include "dirent.h" // dirent implementation for Visual Studio
+#else
+#include <dirent.h>
+#endif
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 #define AMOUNT_ARGS 3
 #define FAILURE_CODE -1
+#define LOG_FILE_NAME "myAntiVirusLog.txt"
+#define QUICK_SCAN_PERCENT 0.2
 
 enum SCANNING_OPTIONS {
 	NORMAL,
 	FAST
 };
 
-bool argumentsChecker(int amout, char** args);
-bool directoryExists(char* path);
-bool fileExists(char* path);
-int menu(char* folderPath, char* signaturePath, FILE* logFile);
+enum SCAN_RESULT {
+	CLEAN,
+	INFECTED,
+	SCAN_ERROR
+};
+
+bool argumentsChecker(int amount, char** args);
+bool directoryExists(const char* path);
+bool fileExists(const char* path);
+int menu(const char* folderPath, const char* signaturePath, FILE* logFile);
 int countFiles(DIR* directory);
 char** getFileNames(DIR* directory, int filesCount, FILE* logFile);
-void sortFileNames(char** arr, int size);
-int calcFileSize(FILE* file);
-char* getBFileContent(FILE* file, FILE* logFile);
-char* scanFile(char* signatureContent, FILE* file, int option, FILE* logFile);
-bool findSignature(FILE* file, char* signatureContent, char* fileContent, float fromPrec, float toPrec);
-void printAndLog(char* msg, FILE* logFile);
+int compareFileNames(const void* a, const void* b);
+long calcFileSize(FILE* file);
+char* getBFileContent(FILE* file, FILE* logFile, long* size);
+int scanFile(const char* signature, long signatureSize, FILE* file, int option, const char** location, FILE* logFile);
+bool findSignature(const char* fileContent, long fileSize, const char* signature, long signatureSize, double fromPerc, double toPerc);
+void printAndLog(FILE* logFile, const char* format, ...);
 
 int main(int argc, char** argv)
 {
@@ -33,69 +53,84 @@ int main(int argc, char** argv)
 	}
 	const char* directoryPath = argv[1];
 	const char* virusSignaturePath = argv[2];
-	
+
 	//create the log path
 	char logPath[PATH_MAX];
-	strcpy(logPath, "");
-	strcat(logPath, directoryPath);
-	strcat(logPath, "/");
-	strcat(logPath, "myAntiVirusLog.txt");
+	if (snprintf(logPath, sizeof(logPath), "%s/%s", directoryPath, LOG_FILE_NAME) >= (int)sizeof(logPath))
+	{
+		printf("the directory path is too long!\n");
+		return FAILURE_CODE;
+	}
 	FILE* logFile = fopen(logPath, "w+");
 	if (!logFile)
 	{
-		printf("error to create the log file! ");
+		printf("error to create the log file! \n");
 		return FAILURE_CODE;
 	}
 
 	int choice = menu(directoryPath, virusSignaturePath, logFile); //getting the selected scan option
 
-	//getting file signature
+	//getting file signature (as raw bytes, it may contain zeros)
 	FILE* signatureFile = fopen(virusSignaturePath, "rb");
-	char* signatureContent = getBFileContent(signatureFile, logFile);
+	if (!signatureFile)
+	{
+		printAndLog(logFile, "Failed to open the signature file: %s\n", virusSignaturePath);
+		fclose(logFile);
+		return FAILURE_CODE;
+	}
+	long signatureSize = 0;
+	char* signatureContent = getBFileContent(signatureFile, logFile, &signatureSize);
 	fclose(signatureFile);
+	if (!signatureContent || signatureSize == 0)
+	{
+		printAndLog(logFile, "The signature file is empty or unreadable!\n");
+		free(signatureContent);
+		fclose(logFile);
+		return FAILURE_CODE;
+	}
 
 	// getting the file's names
 	DIR* directory = opendir(directoryPath);
 	int filesAmount = countFiles(directory);
 	char** fileNames = getFileNames(directory, filesAmount, logFile);
 	closedir(directory);
-	sortFileNames(fileNames, filesAmount);
+	qsort(fileNames, filesAmount, sizeof(char*), compareFileNames);
 
-	char filePath[PATH_MAX]; //PATH_MAX is a define in dirent.h for the buffer of the path string 
-	for (int i = 0; i < filesAmount; i++) 
+	char filePath[PATH_MAX]; //PATH_MAX is the size of the buffer of the path string
+	for (int i = 0; i < filesAmount; i++)
 	{
-		// crearting path each file  
-		strcpy(filePath, ""); 
-		strcat(filePath, directoryPath);
-		strcat(filePath, "/");
-		strcat(filePath, fileNames[i]);
+		if (strcmp(fileNames[i], LOG_FILE_NAME) == 0) //the log file is not part of the scan
+			continue;
+
+		// creating path for each file
+		if (snprintf(filePath, sizeof(filePath), "%s/%s", directoryPath, fileNames[i]) >= (int)sizeof(filePath))
+		{
+			printAndLog(logFile, "The path is too long: %s/%s\n", directoryPath, fileNames[i]);
+			continue;
+		}
 
 		FILE* file = fopen(filePath, "rb");
 		if (!file)
 		{
-			printf("Failed to open the file: %s\n", filePath);
-			fprintf(logFile, "Failed to open the file: %s\n", filePath);
-			return FAILURE_CODE;
+			printAndLog(logFile, "Failed to open the file: %s\n", filePath);
+			continue;
 		}
 
-		char* fileState = scanFile(signatureContent, file, choice, logFile);
+		const char* location = "";
+		int state = scanFile(signatureContent, signatureSize, file, choice, &location, logFile);
 		fclose(file);
 
-		if (fileState != NULL)
-		{
-			printf("%s Infected!%s\n", filePath, fileState);
-			fprintf(logFile, "%s Infected!%s\n", filePath, fileState);
-		}
+		if (state == INFECTED)
+			printAndLog(logFile, "%s Infected!%s\n", filePath, location);
+		else if (state == CLEAN)
+			printAndLog(logFile, "%s Clean!\n", filePath);
 		else
-		{
-			printf("%s Clean!\n", filePath);
-			fprintf(logFile, "%s Clean!\n", filePath);
-		}
+			printAndLog(logFile, "%s Could not be scanned!\n", filePath);
 	}
-	printf("\nSee the results on %s", logPath);
+	printf("\nSee the results on %s\n", logPath);
 	fclose(logFile);
 	free(signatureContent);
-	
+
 	for (int i = 0; i < filesAmount; i++)
 	{
 		free(fileNames[i]);
@@ -107,74 +142,72 @@ int main(int argc, char** argv)
 /*checks if the entered arguments to the main are valid
 input: the amount of arguments and the arguments
 output: if the args are valid or not*/
-bool argumentsChecker(int amout, char** args)
+bool argumentsChecker(int amount, char** args)
 {
-	if (amout != AMOUNT_ARGS)
-		return FALSE;	
+	if (amount != AMOUNT_ARGS)
+		return false;
 
-	if (!directoryExists(args[1])) 
-		return FALSE;
+	if (!directoryExists(args[1]))
+		return false;
 	if (!fileExists(args[2]))
-		return FALSE;
-	
-	return TRUE;
+		return false;
+
+	return true;
 }
 
 /*checks if the path is a directory and exists
 * input: the path of the directory
 * output: if it dir or not
 */
-bool directoryExists(char* path)
+bool directoryExists(const char* path)
 {
 	DIR* checkedDir = opendir(path);
-	if (checkedDir) 
+	if (checkedDir)
 	{
 		//The directory exists
-		closedir(checkedDir);	
-		return TRUE;
+		closedir(checkedDir);
+		return true;
 	}
 	// Not a directory,or may be a file or does not exist
 	printf("dir doesnt exist\n");
-	return FALSE;
+	return false;
 }
 
 /*checks if the path is is file and exists
 input: the path of the file
 output: if the file is exists or not */
-bool fileExists(char* path) 
+bool fileExists(const char* path)
 {
 	FILE* checkedFile = fopen(path, "r");
 	if (checkedFile)
 	{
 		// File exists
 		fclose(checkedFile);
-		return TRUE;
+		return true;
 	}
 	// File does not exist
 	printf("file doesnt exist\n");
-	return FALSE;
+	return false;
 }
 
 /*prints the menu and gets the user scan option and for the log file
 input: the directory's and file's path and the log file
 output: the option normal or fast*/
-int menu(char* folderPath, char* signaturePath, FILE* logFile)
+int menu(const char* folderPath, const char* signaturePath, FILE* logFile)
 {
-	char choice;
+	char choice = '1';
 	printf("Welcome to my Virus Scan! \n\n");
 	fprintf(logFile, "Welcome Anti-Virus began!\n\n");
 
-	printf("Folder to scan: %s\n", folderPath);
-	fprintf(logFile, "Folder to scan: %s\n", folderPath);
-
-	printf("Virus signature: %s\n\n", signaturePath);
-	fprintf(logFile, "Virus signature: %s\n\n", signaturePath);
+	printAndLog(logFile, "Folder to scan: %s\n", folderPath);
+	printAndLog(logFile, "Virus signature: %s\n\n", signaturePath);
 
 	printf("Press 0 for a normal scan or any other key for a quick scan: ");
 
-	scanf("%c", &choice);
+	if (scanf(" %c", &choice) != 1) //no input means a quick scan
+		choice = '1';
 	fprintf(logFile, "Scanning option:\n");
-	if(choice == '0')
+	if (choice == '0')
 		fprintf(logFile, "Normal Scan\n\n");
 	else
 		fprintf(logFile, "Quick Scan\n\n");
@@ -198,9 +231,9 @@ int countFiles(DIR* directory)
 	int fileCounter = 0;
 	struct dirent* dir;
 
-	while ((dir = readdir(directory)) != NULL) //enter into the dir 
+	while ((dir = readdir(directory)) != NULL) //enter into the dir
 	{
-		if (dir->d_type == DT_REG) //checking if it's a regular file 
+		if (dir->d_type == DT_REG) //checking if it's a regular file
 			fileCounter++;
 	}
 
@@ -210,146 +243,155 @@ int countFiles(DIR* directory)
 
 /*gets all the file names in the entered dir
 input: the dir and amount of files in and the log file
-output: array of all the paths*/
+output: array of all the names*/
 char** getFileNames(DIR* directory, int filesCount, FILE* logFile)
 {
 	struct dirent* dir;
 	char** fileNames;
 
-	fileNames = (char**)malloc(sizeof(char*) * filesCount); //creating an array for storing the file's paths
+	fileNames = (char**)malloc(sizeof(char*) * (filesCount > 0 ? filesCount : 1)); //creating an array for storing the file's names
 	if (!fileNames)
 	{
-		printf("allocation failed\n");
-		fprintf(logFile, "allocation failed\n");
-		exit(FAILURE_CODE); //ending the program 
+		printAndLog(logFile, "allocation failed\n");
+		exit(FAILURE_CODE); //ending the program
 	}
 
-	for (int i = 0; (dir = readdir(directory)) != NULL;) 
+	for (int i = 0; i < filesCount && (dir = readdir(directory)) != NULL;)
 	{
 		if (dir->d_type == DT_REG) //checking if the file is regular
 		{
-			fileNames[i] = (char*)malloc(sizeof(char) * (dir->d_namlen + 1)); //added 1 for the null
+			fileNames[i] = (char*)malloc(strlen(dir->d_name) + 1); //added 1 for the null
 			if (!(fileNames[i]))
 			{
-				printf("allocation failed\n");
-				fprintf(logFile, "allocation failed\n");
-				exit(FAILURE_CODE); //ending the program 
+				printAndLog(logFile, "allocation failed\n");
+				exit(FAILURE_CODE); //ending the program
 			}
 
-			strcpy(fileNames[i], dir->d_name); 
+			strcpy(fileNames[i], dir->d_name);
 			i++;
 		}
-	}	
+	}
 	rewinddir(directory);
 	return fileNames;
 }
 
-/*sorts the array of file names by using bubble sort
-input: the array and it's size
-output: none*/
-void sortFileNames(char** arr, int size)
+/*compares two file names, used by qsort to sort the names alphabetically
+input: pointers to two names
+output: negative / zero / positive like strcmp*/
+int compareFileNames(const void* a, const void* b)
 {
-	char temp[PATH_MAX]; // temporary string to hold for swap action.
-	for (int i = 0; i < size - 1; i++)
-	{
-		for (int j = 0; j < size - i - 1; j++) 
-		{
-			if (strcmp(arr[j], arr[j + 1]) > 0)
-			{
-				strcpy(temp, arr[j]);
-				strcpy(arr[j], arr[j + 1]);
-				strcpy(arr[j + 1], temp); 
-			}
-		}
-	}
+	return strcmp(*(char* const*)a, *(char* const*)b);
 }
 
 /*calcs the size in bytes of file
 input: the file
-output: the size*/
-int calcFileSize(FILE* file)
+output: the size, or -1 on failure*/
+long calcFileSize(FILE* file)
 {
-	fseek(file, 0, SEEK_END);
-	int fileSize = ftell(file);
+	if (fseek(file, 0, SEEK_END) != 0)
+		return -1;
+	long fileSize = ftell(file);
 	rewind(file);
 	return fileSize;
 }
 
-/*scans the content of binary file into a string 
-input: the path of the file and log file
-output: the content*/
-char* getBFileContent(FILE* file, FILE* logFile)
+/*reads the whole content of a binary file into a buffer
+input: the file, the log file, a pointer that receives the size in bytes
+output: the content (the caller frees it), or NULL if the file can't be read*/
+char* getBFileContent(FILE* file, FILE* logFile, long* size)
 {
-	int fileSize = calcFileSize(file);
+	*size = calcFileSize(file);
+	if (*size < 0)
+		return NULL;
 
-	char* fileContent = (char*)malloc(sizeof(char) * (fileSize + 1));
+	char* fileContent = (char*)malloc((size_t)*size + 1);
 	if (!fileContent)
 	{
-		printf("allocation is failed!!\n");
-		fprintf(logFile, "allocation is failed!!\n");
-		exit(FAILURE_CODE); //ending the program 
+		printAndLog(logFile, "allocation is failed!!\n");
+		exit(FAILURE_CODE); //ending the program
 	}
 
-	fread(fileContent, 1, fileSize, file);
-	fileContent[fileSize] = '\0'; 
+	if (fread(fileContent, 1, (size_t)*size, file) != (size_t)*size)
+	{
+		free(fileContent);
+		return NULL;
+	}
+	fileContent[*size] = '\0';
 
 	return fileContent;
 }
 
-/*reads the content of a file and scans for a signature within the file content
-and returns a string indicating where the signature was found based on the selected search option
-or if clean null 
-input: the content of the signature, the file, the user option
-output: where the signature was found  based on the selected search option or if clean null*/
-char* scanFile(char* signatureContent, FILE* file, int option, FILE* logFile) 
+/*reads the content of a file and scans for the signature within it
+the normal scan checks the whole file, the quick scan checks only the first and the last 20%
+input: the signature and its size, the file, the user option, a pointer that receives where
+the signature was found (empty string / " (first 20%)" / " (last 20%)"), the log file
+output: CLEAN, INFECTED or SCAN_ERROR if the file can't be read*/
+int scanFile(const char* signature, long signatureSize, FILE* file, int option, const char** location, FILE* logFile)
 {
-	char* fileContent = getBFileContent(file, logFile);
-	char* answer = NULL;
+	long size = 0;
+	char* fileContent = getBFileContent(file, logFile, &size);
+	if (!fileContent)
+		return SCAN_ERROR;
 
-	switch (option)
+	int result = CLEAN;
+	*location = "";
+
+	if (option == NORMAL)
 	{
-		case NORMAL:
-			answer = findSignature(file, signatureContent, fileContent, 0, 1) ? "" : NULL;
-		case FAST:
+		if (findSignature(fileContent, size, signature, signatureSize, 0, 1))
+			result = INFECTED;
+	}
+	else
+	{
+		if (findSignature(fileContent, size, signature, signatureSize, 0, QUICK_SCAN_PERCENT))
 		{
-			if (findSignature(file, signatureContent, fileContent, 0, 0.2))
-				answer = " (first 20%)";
-			if (findSignature(file, signatureContent, fileContent, 0.8, 1))
-				answer = " (last 20%)";
-			if (findSignature(file, signatureContent, fileContent, 0.2, 0.8))
-				answer = "";
+			result = INFECTED;
+			*location = " (first 20%)";
+		}
+		else if (findSignature(fileContent, size, signature, signatureSize, 1 - QUICK_SCAN_PERCENT, 1))
+		{
+			result = INFECTED;
+			*location = " (last 20%)";
 		}
 	}
 
 	free(fileContent);
-	return answer;
+	return result;
 }
 
-
-/*searches the signature of the virus in the content of the checked file
-input: the file, the content of the virus signature, the content of the file, 
+/*searches the signature of the virus in a part of the content of the checked file.
+the comparison is done byte by byte with the sizes, so zero bytes in the
+file or in the signature are handled correctly (unlike strstr)
+input: the content of the file and its size, the signature and its size,
 initial percentage of the file, final percentage of the file
-
-output: if the signature is exist of not*/
-bool findSignature(FILE* file, char* signatureContent, char* fileContent, float fromPerc, float toPerc)
+output: if the signature exists in that part of the file or not*/
+bool findSignature(const char* fileContent, long fileSize, const char* signature, long signatureSize, double fromPerc, double toPerc)
 {
-	int fileSize = calcFileSize(file);
+	long start = (long)(fileSize * fromPerc);
+	long end = (long)(fileSize * toPerc);
 
-	//index is the place where the checking is starting from in the file content
-	for (int index = (int)(fileSize * fromPerc); index < (int)(fileSize * toPerc);)
+	if (signatureSize <= 0 || end - start < signatureSize)
+		return false; //the signature can't fit in this part
+
+	for (long index = start; index <= end - signatureSize; index++)
 	{
-		// if the strstr finds null it refer to it as the end of the string
-		//checking parts of the string contents until it finds NULL
-		if (strstr((fileContent + index), signatureContent) != NULL)
-			return TRUE; //the file infected 
-		index += strlen(fileContent + index) + 1; //pass the NULL char and try checking again
-		//back to the loop if there is more string in the range after passing the null or stopping the loop
+		if (fileContent[index] == signature[0] && memcmp(fileContent + index, signature, (size_t)signatureSize) == 0)
+			return true; //the file infected
 	}
-	return FALSE; //file is clear 
+	return false; //file is clear
 }
 
-void printAndLog(char* msg, FILE* logFile)
+/*prints a message to the screen and writes it to the log file (printf style)
+input: the log file, the format and its arguments
+output: none*/
+void printAndLog(FILE* logFile, const char* format, ...)
 {
-	printf(msg);
-	fprintf(logFile, msg);
+	va_list args;
+	va_start(args, format);
+	vprintf(format, args);
+	va_end(args);
+
+	va_start(args, format);
+	vfprintf(logFile, format, args);
+	va_end(args);
 }
